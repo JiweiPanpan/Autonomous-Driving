@@ -1,0 +1,1074 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+#include <communication/multi_socket.h>
+#include <models/tronis/ImageFrame.h>
+#include <grabber/opencv_tools.hpp>
+#include <models/tronis/BoxData.h>
+#include <thread>
+
+#define _USE_MATH_DEFINES
+using namespace std;
+using namespace cv;
+using namespace std::chrono;
+
+class LaneAssistant
+{
+public:
+    LaneAssistant()
+    {
+    }
+
+    bool processData(tronis::CircularMultiQueuedSocket& socket)
+    {
+        // send results via socket
+        socket.send(tronis::SocketData("Distance" + to_string(dist_curr)));
+        getSteeringInput(socket);
+        getThrottleInput(socket);
+
+        return true;
+    }
+
+protected:
+    std::string image_name_;
+    cv::Mat image_;
+    tronis::LocationSub ego_location_;
+    tronis::OrientationSub ego_orientation_;
+    double ego_velocity_;
+
+    //********************redsign detect**************************
+    bool redSignProcessed = false;  // redsign detect
+    bool timerRunning = false;      // state of timer
+    cv::Mat redsignRoiImg;          // redsign roi
+    double currentSpeed = ego_velocity_ * (36. / 1000.);  //  current speed of the vehicle in km/h (originally in cm/s).
+    //********************whiteline stop**************************
+    bool BrakingProcesse = false;  // state of stop
+    bool haswhiteline = false;     // whiteline detect
+
+
+    // parameters in Aufgabe 2
+    //********************lane detection parameters********************
+    Point ego_leftS, ego_leftE;     // start and end point of left
+    Point ego_rightS, ego_rightE;   // start and end point of right
+    Point directionS, directionE;   //(ego_leftS + ego_rightS) / 2;(ego_leftE + ego_rightE) / 2;
+    double rows = 512, cols = 720;  // size of output picture
+    double laneAdjustment;          // adjust the Error of pid for steering
+    bool hasLeftLane = false, hasRightLane = false;
+
+    // parameters in Aufgabe 3
+    //********************steering control parameters********************
+    Point mittle_of_laneS;  // mittle point of start
+    Point mittle_of_laneE;  // mittle point of end
+    Point mittle_of_image;  // mittle point of image
+    const double halfwidth_S = 112;
+    const double halfwidth_E = 580;
+
+    double steering_input;        // steering input value (via Socket)
+    double steering_pc = 0.0043;  // Proportional value of steering
+    double steering_ic = 0.0001;  // Integral value of steering
+    double steering_dc = 0.055;   // Derivative value of steering
+    double Err_steering;
+    double dErr_steering;
+    double iErr_steering;
+    double lastErr_steering = 0;
+    // parameters in Aufgabe 4
+    //********************throttle control parameters********************
+    double throttle_norm = 0;     // normalized throttle input value
+    double VEL_TAR = 55;          // Target velocity
+    int Throttle_P = 45;          // P-Factor for Throttle PID controller
+    int Throttle_I = 125;         // I-Factor for Throttle PID controller
+    int Throttle_D = 0;           // D-Factor for Throttle PID controller
+    float DIST_DEC = 100;         // detected distance of object in meters
+    double DIST_TAR_MIN = 8;     // target distance to preceeding vehicle
+    int DIST_P = 15;              // P-Factor for DIST PID controller
+    int DIST_I = 15;              // I-Factor for DIST PID controller
+    int DIST_D = 0;               // D-Factor for DIST PID controller
+    int DIST_COUNTER_MAX = 150;   // checks if tronis still sends distance updates
+    double vel_error_P_old = 0;   // velocity P at t-1
+    double vel_error_I_sum = 0;   // velocity I sum
+    double dist_curr = 999;       // current distance to preceeding vehicle
+    double dist_curr_old = 0;     // distance at t-1
+    double dist_error_P_old = 0;  // to check if tronis still updates boxes
+    double dist_error_I_sum = 0;  // distance I sum
+    int dist_counter = 0;         // to check if tronis still updates boxes
+    double vel_tar = 0;           // calculated target velocity
+    double t_dist_diff = 0;       // time since last function call
+    chrono::time_point<chrono::steady_clock> t_dist_start;  // stop count
+    chrono::time_point<chrono::steady_clock> t_dist_stop;
+
+    //**********detectRedsign***************
+
+    void detectRedSigns()
+    {
+        cv::Mat hsvImage1;
+        cvtColor(image_, hsvImage1, cv::COLOR_BGR2HSV);
+
+        // red hsv value
+        cv::Scalar lower_red1(0, 120, 70);
+        cv::Scalar upper_red1(10, 255, 255);
+        cv::Scalar lower_red2(170, 120, 70);
+        cv::Scalar upper_red2(180, 255, 255);
+
+        cv::Mat mask1, mask2;
+        // detect red
+        inRange(hsvImage1, lower_red1, upper_red1, mask1);
+        inRange(hsvImage1, lower_red2, upper_red2, mask2);
+
+        // combine red
+        cv::Mat combinedMask;
+        bitwise_or(mask1, mask2, combinedMask);
+        cv::Mat kernel = getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+        morphologyEx(combinedMask, combinedMask, cv::MORPH_CLOSE, kernel);
+
+        // redsign roi mask
+        cv::Mat redsignmask = Mat::zeros(image_.size(), combinedMask.type());
+        const int num = 4;
+        Point points[1][num] = { Point(cols * 0.4, 0), 
+                                 Point(cols * 0.4, rows * 0.45),
+                                 Point(cols, rows * 0.45), 
+                                 Point(cols, 0) };
+
+        const Point* polygon = points[0];
+        fillConvexPoly(redsignmask, polygon, num, Scalar(255));
+
+        // 3. use red light roi mask to filter red light img
+        cv::bitwise_and(combinedMask, redsignmask, redsignRoiImg);
+        imshow("Red Light Detection roi", redsignRoiImg);
+    }
+
+    void processRedSign()
+    {
+        // Check if the red sign is detected (based on the non-zero pixel count in the ROI image) and it has not been processed yet.
+        if (countNonZero(redsignRoiImg) > 150 && !redSignProcessed)
+        {
+            // If the timer is not already running, start the red sign processing.
+            if (!timerRunning)
+            {
+                cout << "Detected red sign, stopping for 5 seconds." << endl;
+                timerRunning = true; // Mark the timer as running.
+                redSignProcessed = true; // Mark the red sign as processed.
+                
+                // Adjust the vehicle's throttle based on its current velocity to stop.
+                if (currentSpeed > 50) // If velocity is greater than 50 km/h, apply stronger brake.
+                {
+                    throttle_norm = -0.0005;
+                }
+                else if (currentSpeed <= 50) // If velocity is between 20 and 50 km/h, apply moderate brake.
+                {
+                    throttle_norm = -0.0001;
+                }
+                else if (currentSpeed < 20 && throttle_norm < 0) // If velocity is less than 20 km/h, stop braking to avoid reverse motion.
+                {
+                    throttle_norm = 0;
+                    cout << "avoid backwards driving" << endl;
+                }
+                cout << "stop at red light" << endl;
+
+                // Start a detached thread to wait for 5 seconds before continuing the drive.
+                std::thread([&]() {
+                    std::this_thread::sleep_for(std::chrono::seconds(6)); // Wait for 6 seconds (accounting for reaction time to stop).
+                    cout << "5 seconds passed, continue driving." << endl;
+                    timerRunning = false; // Mark the timer as not running.
+
+                    std::this_thread::sleep_for(std::chrono::seconds(15)); // Wait additional 15 seconds before allowing red sign processing again.
+                    redSignProcessed = false; // Reset red sign processing status after a total of 20 seconds.
+                    cout << "Red sign process reset after 20 seconds." << endl;
+                    }).detach(); // Detach the thread to allow it to run independently.
+            }
+        }
+    }
+
+    /*void processBraking()
+    {
+        // Check if a white line is detected and the braking process has not yet been initiated.
+        if (haswhiteline && !BrakingProcesse)
+        {
+            // Ensure that the braking process is only initiated if no other timer-based process is running.
+            if (!timerRunning)
+            {
+                cout << "Detected white line, initiating braking." << endl;
+                timerRunning = true; // Mark the timer as running to prevent overlapping processes.
+                BrakingProcesse = true; // Indicate that the braking process has started.
+
+                // Determine the intensity of the braking based on the current speed.
+                if (currentSpeed > 45)
+                {
+                    throttle_norm = -0.005; // Apply a strong deceleration if the speed is high.
+                }
+                else if (20 < currentSpeed && currentSpeed <= 45)
+                {
+                    throttle_norm = -0.0001; // Apply a moderate deceleration for medium speeds.
+                }
+                else // Prevent the vehicle from driving backwards.
+                {
+                    throttle_norm = 0;
+                    cout << "avoid backwards driving" << endl;
+                }
+                cout << "Braking initiated due to white line detection." << endl;
+
+                // Start a detached thread to simulate the duration of the braking process.
+                std::thread([&]() {
+                    std::this_thread::sleep_for(std::chrono::seconds(5)); // Simulate the braking duration.
+                    cout << "Braking complete, continuing driving." << endl;
+                    timerRunning = false; // Mark the timer as not running to allow other processes.
+
+                    // Reset the braking logic after a delay to avoid immediate retriggering.
+                    std::this_thread::sleep_for(std::chrono::seconds(10)); // Delay to prevent immediate retriggering of the process.
+                    BrakingProcesse = false; // Reset the braking process indicator.
+                    cout << "Braking logic reset." << endl;
+                    }).detach(); // Detach the thread to allow it to run independently without blocking the main execution.
+            }
+        }
+    }*/
+
+    // ************************************
+    // Aufgabe 2: lane detection
+    vector<Vec4d> setLanes()
+    {
+        detectRedSigns(); // Detect red signs in the image
+
+        // Gaussian blur
+        cv::Mat blur_img;
+        GaussianBlur(image_, blur_img, Size(3, 3), 0, 0, BORDER_DEFAULT);
+
+        // Convert to HSV color space
+        cv::Mat hsv_img;
+        cvtColor(blur_img, hsv_img, COLOR_BGR2HSV);
+
+        // Define range for white color in HSV
+        Scalar lower_white = Scalar(106, 0, 180);   
+        Scalar upper_white = Scalar(180, 90, 200);  
+
+
+        // Create a mask that captures areas of the image within the white color range.
+        cv::Mat white_mask;
+        inRange(hsv_img, lower_white, upper_white, white_mask);
+        //// Use morphological operations to close gaps in the white mask.
+        cv::Mat kernel = getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+        morphologyEx(white_mask, white_mask, cv::MORPH_CLOSE, kernel);
+
+        Scalar lower_yellow = Scalar(20, 90, 100);  
+        Scalar upper_yellow = Scalar(30, 255, 255);  
+
+        // Threshold the HSV image to get only yellow colors
+        cv::Mat yellow_mask;
+        inRange(hsv_img, lower_yellow, upper_yellow, yellow_mask);
+
+        morphologyEx(yellow_mask, yellow_mask, cv::MORPH_CLOSE, kernel);
+
+        cv::Mat mask;
+        // Combine the two masks
+        if (countNonZero(yellow_mask) > 100)
+        {
+            mask = yellow_mask;
+        }
+        else
+        {
+            mask = white_mask;
+        }
+
+        //bitwise_or( white_mask, yellow_mask, mask );
+        
+        // Edge detection
+        cv::Mat edge_img;
+        Canny(mask, edge_img, 100, 200);
+
+        morphologyEx(edge_img, edge_img, cv::MORPH_CLOSE, kernel);
+
+        // Define a region of interest (ROI)
+        const int num = 8;
+        Point points[1][num] = { Point(0, rows),
+                                Point(0, rows * 0.7),
+                                Point(cols * 0.2, rows * 0.55),
+                                Point(cols * 0.8, rows * 0.55),
+                                Point(cols, rows * 0.7),
+                                Point(cols, rows),
+                                Point(cols * 0.66, rows * 0.7),
+                                Point(cols * 0.33, rows * 0.7) };
+        const Point* polygon = points[0];
+        cv::Mat roi_mask = Mat::zeros(image_.size(), edge_img.type());
+        fillConvexPoly(roi_mask, polygon, num, Scalar(255));
+
+        cv::Mat roi_img;
+        cv::bitwise_and(edge_img, roi_mask, roi_img);
+
+        imshow("roi_img", roi_img);
+        // Vec4d:x1,x2,y1,y2
+        vector<Vec4d> raw_lanes;
+        HoughLinesP(roi_img, raw_lanes, 1, CV_PI / 180, 50, 50, 10);
+        displayRowLines(image_, raw_lanes); // Display detected lanes on the image
+        return raw_lanes;
+    }
+
+
+    void displayRowLines(cv::Mat image, const std::vector<cv::Vec4d>& lines)
+    {
+        cv::Mat output;
+        image.copyTo(output);
+        for (const auto& line : lines)  // lines is Vec4d, which include x1,x2,y1,y2
+        {
+            cv::line(output, cv::Point(line[0], line[1]),  // start x1,y1
+                cv::Point(line[2], line[3]),          // end x2,y2
+                cv::Scalar(0, 255, 0),
+                2,              // width of edge
+                cv::LINE_AA);  // smooth lines
+        }
+        //cv::imshow("Row Lines", output);
+    }
+
+    void getLanes(vector<Vec4d> raw_lanes)
+    {
+
+        haswhiteline = false;
+
+        // store the left and right lanes.
+        vector<Vec4d> left_lanes, right_lanes;
+        // Variables to store the linear function coefficients of the left and right lanes.
+        Vec4f left_lane_function, right_lane_function;
+        vector<Point> left_points, right_points, whiteline_points;
+        double left_slope = 0.0, right_slope = 0.0;
+        
+        // Initialize start and end points for ego lane visualization.
+        ego_leftS.y = 300;
+        ego_leftE.y = 500;
+        ego_rightS.y = 300;
+        ego_rightE.y = 500;
+
+        double left_k, right_k;  // Variables for slope (k) of left and right lanes.
+        Point left_b, right_b;   // Points on the left and right lines for calculating positions.
+        hasLeftLane = false;
+        hasRightLane = false;
+
+        // lanes:vec4d
+        for (auto lane : raw_lanes)
+        {
+            // mittel point of x
+            double lane_center = (lane[0] + lane[2]) / 2;
+            // lane center in left side belongs to left lanes
+            if (lane_center < cols / 2)
+            {
+                left_lanes.push_back(lane);
+                hasLeftLane = true;
+            }
+            else
+            {
+                right_lanes.push_back(lane);
+                hasRightLane = true;
+            }
+        }
+
+        // Process left lanes to differentiate between potential white lines (low slope) and actual lane lines.
+        for (auto left_lane : left_lanes)
+        {
+            double slope = (left_lane[3] - left_lane[1]) / (left_lane[2] - left_lane[0]);
+            // If the slope is very gentle, treat the segment as a white line
+            if (abs(slope) < 0.05)
+            {
+                whiteline_points.push_back(Point(left_lane[0], left_lane[1]));
+                whiteline_points.push_back(Point(left_lane[2], left_lane[3]));
+            }
+            else
+            {
+                left_points.push_back(Point(left_lane[0], left_lane[1]));
+                left_points.push_back(Point(left_lane[2], left_lane[3]));
+            }
+            // If any white line points were added, set the flag.
+            if (!whiteline_points.empty())
+            {
+                haswhiteline = true;
+            }
+            // If there are points in the left lane, fit a line to these points.
+            if (left_points.size() > 0)
+            {
+                // use the fitLine to fit an optimal straight line based on the points in left
+                // points cv::DIST_L2 is L2 norm, 0 not use , 0.1 accurate of distance from point to
+                // line , 0.01 accurate of direction
+                cv::fitLine(left_points, left_lane_function, cv::DIST_L2, 0, 0.1, 0.01);
+                // get the slope for left.  left_lane_function[1] :y/ left_lane_function[0]:x
+                left_k = left_lane_function[1] / left_lane_function[0];
+                // a point from line. left_lane_function[2] :x,left_lane_function[3]:y
+                left_b = Point(left_lane_function[2], left_lane_function[3]);
+                // x=(y-b)/k
+                ego_leftS.x = (ego_leftS.y - left_b.y) / left_k + left_b.x;
+                ego_leftE.x = (ego_leftE.y - left_b.y) / left_k + left_b.x;
+                left_k += left_k;
+                left_k /= right_points.size() / 2;
+		
+		//cout << "ego_leftS" << ego_leftS.x << endl;
+                //cout << "ego_leftE" << ego_leftE.x << endl;
+
+            }
+            else
+            {
+                cout << "left lane is empty" << endl;
+            }
+        }
+
+        for (auto right_lane : right_lanes)
+        {
+            double slope = (right_lane[3] - right_lane[1]) / (right_lane[2] - right_lane[0]);
+
+            if (abs(slope) < 0.05)
+            {
+                whiteline_points.push_back(Point(right_lane[0], right_lane[1]));
+                whiteline_points.push_back(Point(right_lane[2], right_lane[3]));
+            }
+            else
+            {
+                right_points.push_back(Point(right_lane[0], right_lane[1]));
+                right_points.push_back(Point(right_lane[2], right_lane[3]));
+            }
+            if (!whiteline_points.empty())
+            {
+                haswhiteline = true;
+            }
+            if (right_points.size() > 0)
+            {
+                // use the fitLine to fit an optimal straight line based on the points
+                // in left points cv::DIST_L2 is L2 norm, 0 not use , 0.1 accurate of
+                // distance from point to line , 0.01 accurate of direction
+                cv::fitLine(right_points, right_lane_function, cv::DIST_L2, 0, 0.1, 0.01);
+                // get the slope for left.  right_lane_function[1] :y/
+                // right_lane_function[0]:x
+                right_k = right_lane_function[1] / right_lane_function[0];
+                // a point from line. right_lane_function[2] :x,right_lane_function[3]:y
+                right_b = Point(right_lane_function[2], right_lane_function[3]);
+                // x=(y-b)/k
+                ego_rightS.x = (ego_rightS.y - right_b.y) / right_k + right_b.x;
+                ego_rightE.x = (ego_rightE.y - right_b.y) / right_k + right_b.x;
+
+                right_k += right_k;
+                right_k /= right_points.size() / 2;
+		
+		//cout << "ego_rightS" << ego_rightS.x << endl;
+                //cout << "ego_rightE" << ego_rightE.x << endl;
+
+            }
+            else
+            {
+                cout << "right lane is empty" << endl;
+            }
+        }
+
+
+
+
+        /*if( left_points.size() > 0 && !right_points.size() )
+        {
+            // 只检测到左侧车道线，适当调整转向输入使车辆向右偏，以尝试保持在车道中心
+            // 这里的调整策略需要根据实际情况进行调整
+            if(  0.35<left_slope <-0.2 )
+            {
+                laneAdjustment = left_slope * ( -50 );  // 假设值，需要根据实际情况调整
+                cout << "rightleft_slope" << left_slope << endl;
+                cout << "rightlaneAdjustment" << laneAdjustment << endl;
+            }
+            else if( -0.75 <left_slope <-0.5)
+            {
+               laneAdjustment = left_slope * (20);  // 假设值，需要根据实际情况调整
+               cout << "leftleft_slope" << left_slope << endl;
+               cout << "leftlaneAdjustment" << laneAdjustment << endl;
+            }
+
+
+        }
+        else if( left_points.size() == 0 && right_points.size() > 0 )
+        {
+            // 只检测到右侧车道线，适当调整转向输入使车辆向左偏
+            laneAdjustment = right_slope * ( -100 );  // 假设值，需要根据实际情况调整
+
+            cout << "laneAdjustment" << laneAdjustment << endl;
+        }
+        else if( left_points.size() > 0 && right_points.size() > 0 )
+        {
+            // 只检测到右侧车道线，适当调整转向输入使车辆向左偏
+            laneAdjustment = 0;  // 假设值，需要根据实际情况调整
+        }*/
+
+
+        // Aufgabe 3
+        // Calculate the middle of the lane based on the presence of left and/or right lanes.
+        if (hasLeftLane && hasRightLane)
+        {
+            directionS = (ego_leftS + ego_rightS) / 2;
+            directionE = (ego_leftE + ego_rightE) / 2;
+            mittle_of_laneE.y = directionE.y;
+            mittle_of_laneE.x = directionE.x;
+            mittle_of_laneS.y = directionS.y;
+            mittle_of_laneS.x = directionS.x;
+            mittle_of_image.x = cols * 0.5;
+            mittle_of_image.y = mittle_of_laneE.y;
+        }
+
+        if (hasLeftLane && !hasRightLane)
+        {
+            // If only the left lane is detected, offset to estimate the middle.
+            mittle_of_laneS.x = ego_leftS.x + halfwidth_S;
+            mittle_of_laneS.y = ego_leftS.y;
+            mittle_of_laneE.x = ego_leftE.x + halfwidth_E;
+            mittle_of_laneE.y = ego_leftE.y;
+
+        }
+        
+        else if (!hasLeftLane && hasRightLane)
+        {
+            // If only the right lane is detected, offset to estimate the middle
+            mittle_of_laneS.x = ego_rightS.x - halfwidth_S;
+            mittle_of_laneS.y = ego_rightS.y;
+            mittle_of_laneE.x = ego_rightE.x - halfwidth_E;
+            mittle_of_laneE.y = ego_rightE.y;
+
+        }
+    }
+
+    void detectLanes()
+    {
+        
+        // call thhe setLanes function and store the returned result in raw_lanes
+        vector<Vec4d> raw_lanes = setLanes();
+        // distinguish left and right lane lines
+        getLanes(raw_lanes);
+
+        if (hasLeftLane && !hasRightLane)
+        {
+            // draw a line, from start to the end. 3: width, LINE_AA: make line smooth
+            line(image_, ego_leftS, ego_leftE, Scalar(66, 0, 150), 3, LINE_AA);
+            // Draw a line representing the middle of the lane based on the left lane detection.
+            line(image_, Point(mittle_of_laneS.x, mittle_of_laneS.y), Point(mittle_of_laneE.x, mittle_of_laneE.y),
+                Scalar(100, 100, 0), 3, LINE_AA);
+            // Define the radius for the circles to be drawn.
+            int radius = 5;
+            Scalar color1(0, 0, 255);//red
+            Scalar color2(0, 255, 0);//green
+            // Draw circles at the end of the middle lane line and the image center for visualization.
+            circle(image_, mittle_of_laneE, radius, color1, -1);
+            circle(image_, mittle_of_image, radius, color2, -1);
+        }
+        if (!hasLeftLane && hasRightLane)
+        {
+            line(image_, ego_rightS, ego_rightE, Scalar(0, 66, 150), 3, LINE_AA);
+            line(image_, Point(mittle_of_laneS.x, mittle_of_laneS.y), Point(mittle_of_laneE.x, mittle_of_laneE.y),
+                Scalar(100, 100, 0), 3, LINE_AA);
+            int radius = 5;
+            Scalar color1(0, 0, 255);
+            Scalar color2(0, 255, 0);
+            circle(image_, mittle_of_laneE, radius, color1, -1);
+            circle(image_, mittle_of_image, radius, color2, -1);
+
+        }
+        if (hasLeftLane && hasRightLane)
+        {
+            line(image_, ego_leftS, ego_leftE, Scalar(0, 0, 255), 3, LINE_AA);
+            line(image_, ego_rightS, ego_rightE, Scalar(0, 0, 255), 3, LINE_AA);
+            line(image_, Point(directionS.x, directionS.y), Point(directionE.x, directionE.y),
+                Scalar(255, 0, 0), 3, LINE_AA);
+            int radius = 5;
+            Scalar color1(0, 0, 255);
+            Scalar color2(0, 255, 0);
+            circle(image_, mittle_of_laneE, radius, color1, -1);
+            circle(image_, mittle_of_image, radius, color2, -1);
+        }
+
+    }
+
+    // Aufgabe 3
+    void setSteeringInput()
+    {
+        // Calculate the error in steering based on the deviation of the lane's middle point from the image center.
+        // laneAdjustment
+        Err_steering =
+            (mittle_of_laneS.x * 1 + mittle_of_laneE.x * 0) - cols * 0.5  ;
+        // Calculate the derivative of the steering error for proportional-derivative control.
+        dErr_steering = Err_steering - lastErr_steering;
+        // Calculate the integral of the steering error for integral control.
+        iErr_steering = Err_steering + lastErr_steering;
+        // Update the last error for the next cycle.
+        lastErr_steering = Err_steering;
+        // Calculate the steering input based on proportional, derivative, and integral components.
+        steering_input =
+            steering_pc * Err_steering + steering_dc * dErr_steering + steering_ic * iErr_steering;
+        // Clamp the steering input to a maximum and minimum value to ensure it stays within a feasible range.
+        
+        if (steering_input > 0.6)
+            steering_input = 0.6;
+        if (steering_input < -0.6)
+            steering_input = -0.6;
+        // If the steering input is very close to zero, set it to exactly zero to avoid unnecessary steering adjustments.
+        if (steering_input > -0.01 && steering_input < 0.01)
+        {
+            steering_input = 0;
+        }
+    }
+
+    void getSteeringInput(tronis::CircularMultiQueuedSocket& socket)
+    {
+        setSteeringInput();
+        // Prefix for the message to be sent over the socket, indicating it's related to steering.
+        string prefix_steering = "Steering value";
+        socket.send(tronis::SocketData(prefix_steering + to_string(steering_input)));
+    }
+
+    //**************************
+    // Aufgabe 4: Throttle control
+
+    //---------------------throttle control-------------------------
+
+    bool processPoseVelocity(tronis::PoseVelocitySub* msg)
+    {
+        // Update the ego vehicle's current location, orientation, and velocity from the message.
+        ego_location_ = msg->Location;
+        ego_orientation_ = msg->Orientation;
+        ego_velocity_ = msg->Velocity;
+        return true;
+    }
+    // Function to process bounding box data received from sensors and filter it for further processing.
+    bool processBox(tronis::BoxDataSub* msg)
+    {
+        vector<string> box_names;// Stores the names of detected objects.
+        vector<double> box_distances;// Stores the distances of detected objects from the ego vehicle.
+        
+        
+        // Iterate through all detected objects within the bounding box message.
+        for (int i = 0; i < msg->Objects.size(); i++)
+        {
+            // std::cout << msg->ToString() << std::endl;
+            // Reference to the current object.
+
+            tronis::ObjectSub& box = msg->Objects[i];
+
+            // filter for right object size
+            // if( box.BB.Extends.X > 100 && box.BB.Extends.X < 400 && box.BB.Extends.Y > 100 &&
+            //    box.BB.Extends.Y < 300 )
+            // Filter objects based on their size to exclude objects that are too small or too large.
+            if (box.BB.Extends.X > 100 && box.BB.Extends.X < 800 && box.BB.Extends.Y > 100 &&
+                box.BB.Extends.Y < 800)
+            {
+                // Ensure the detected object is not the ego vehicle itself.
+                if (box.Pose.Location.X != 0.0)
+                {
+                    // remove vehicles from parallel lanes
+                    if (abs(box.Pose.Location.Y) < 400)
+                    {
+                        // cout << box.ActorName.Value() << ", is " << _hypot(
+                        // box.Pose.Location.X / 100, box.Pose.Location.Y / 100 ) << " m ahead."
+                        // << endl;
+                        double dist_curr_temp =
+                            _hypot(box.Pose.Location.X / 100, box.Pose.Location.Y / 100);
+                        // Compensate for the sensor's position on the vehicle
+                        if (dist_curr_temp > 5)
+                        {
+                            dist_curr_temp -= 5;
+                        }
+                        // Store the object's name and adjusted distance.
+                        box_names.push_back(box.ActorName.Value());
+                        box_distances.push_back(dist_curr_temp);
+                    }
+                }
+            }
+        }
+        // find minimum distance box
+        double box_min_it = -1;// Index of the closest object.
+        double box_min = 100;// Initialize with a high value to ensure any real distance is smaller.
+        for (int i = 0; i < box_names.size(); i++)
+        {
+            // cout << "Box " << i << ": " << box_names[i] << " (" << box_distances[i] << "m)"
+            // << endl;
+            if (box_distances[i] < box_min)
+            {
+                box_min = box_distances[i];
+                box_min_it = i; // Update the index of the closest object.
+            }
+        }
+        // If a closest object is found, use its distance for distance control
+        if (box_min_it != -1)
+        {
+            // cout << "Target Box " << box_min_it << ": " << box_names[box_min_it] << " (" <<
+            // box_distances[box_min_it] << "m)" << endl;
+            dist_curr = box_distances[box_min_it];// Update the current distance with the closest object's distance.
+        }
+
+        return true;
+    }
+
+    void throttleControl()
+    {
+        double vel_curr = ego_velocity_ * (36. / 1000.);  // from cm/s to km/h
+        
+        // If the current distance to the object ahead is less than the deceleration distance, start the control logic.
+        if (dist_curr < DIST_DEC)                          // acc function
+        {
+            // Stop the stopwatch to calculate the time difference for PID components
+            t_dist_stop = chrono::steady_clock::now();
+            t_dist_diff =
+                chrono::duration_cast<chrono::milliseconds>(t_dist_stop - t_dist_start).count();
+
+            // Set the target distance based on half of the current speed, with a minimum threshold.
+            double dist_tar =0.5 * vel_curr;  
+            if (vel_curr < 14)
+            {
+                dist_tar = DIST_TAR_MIN;
+            }
+            // Calculate the proportional error in distance
+            double dist_error_P = dist_curr - dist_tar;
+            // Calculate the derivative error in distance.
+            double dist_error_D = (dist_error_P - dist_error_P_old) / t_dist_diff;
+
+            // To avoid division by zero or very short time intervals causing instability in I component.
+            if (t_dist_diff < 100)  
+            {
+                double dist_error_I_next =
+                    ((double)DIST_I / 1e6) * (dist_error_I_sum + dist_error_P * t_dist_diff);
+                // allow the I part to only influence +- 2kph and include time since last call
+               
+                //if (dist_error_I_next <= 2)
+                //{
+                //    dist_error_I_sum += dist_error_P * t_dist_diff;
+                //}
+            }
+
+            // Calculate the target velocity using PID control formula.
+            vel_tar = vel_curr + dist_error_P * ((double)DIST_P / 10) +
+                dist_error_I_sum * ((double)DIST_I / 1e6) +
+                dist_error_D * ((double)DIST_D / 1e6);
+
+            ///// in braking scenarios, remove the offset again, including hysteresis
+            //         if( ( dist_curr < DIST_TAR_SLOW || abs( dist_curr - DIST_TAR_SLOW ) < 3
+            //         ))
+            //         {
+            //             vel_tar -= vel_curr;
+            //         }
+
+            if (vel_tar < 1)  // avoid negative target velocities
+            {
+                vel_tar = 0;
+            }
+
+            // Reduce the integral component when close to the target vehicle at low speed to avoid overshooting.
+            //删除
+            if ((dist_curr < DIST_TAR_MIN || abs(dist_curr - DIST_TAR_MIN) < 3) && vel_tar < 5)
+            {
+                dist_error_I_sum *= 0.9;
+                cout << "dist I reduction" << endl;
+            }
+
+            // Reset distance control if there are no updates from sensor data
+            dist_curr_old = dist_curr;
+            if (dist_curr == dist_curr_old)
+            {
+                dist_counter++;
+
+                if (dist_counter >= DIST_COUNTER_MAX)
+                {
+                    // Reset distance to a value outside the control range.
+                    dist_curr = DIST_DEC + 1;
+                    dist_counter = 0;
+                }
+            }
+            // start stopwatch
+            t_dist_start = chrono::steady_clock::now();
+
+            cout << "distance: " << dist_curr << " m, target: " << dist_tar
+                << " m || P = " << ((double)DIST_P / 10)
+                << " == " << dist_error_P * ((double)DIST_P / 10)
+                << ", I = " << ((double)DIST_I / 1e6)
+                << " == " << dist_error_I_sum * ((double)DIST_I / 1e6)
+                << ", D = " << ((double)DIST_D / 1e6)
+                << " == " << dist_error_D * ((double)DIST_D / 1e6) << " || cmd: " << vel_tar
+                << " kmh" << endl;
+
+            // Process signals for stopping at red signs and apply the calculated target velocity.
+            processRedSign();
+            // processBraking();
+            velocityControl(vel_curr, vel_tar, true);
+        }
+        else
+        {
+            // If the vehicle is not in the range for deceleration control, continue with normal velocity control.
+            processRedSign();
+            // processBraking();
+            velocityControl(vel_curr, vel_tar, false);
+        }
+    }
+    void velocityControl(double vel_c, double vel_t, bool acc_flag)
+    {
+        // Execute normal velocity control logic when not stopped for a red sign
+        if (!timerRunning)
+        {
+            if (acc_flag)
+            {
+                // If acceleration is allowed but the target velocity exceeds the maximum, limit it.
+                if (VEL_TAR < vel_t)
+                {
+                    vel_t = VEL_TAR;
+                }
+            }
+            else
+            {
+                // If not accelerating, set the target velocity to a predefined constant target velocity.
+                vel_t = VEL_TAR;
+            }
+
+            // Calculate PID control errors for velocity adjustment.
+            // Proportional error based on the difference between target and current velocity.
+            double vel_error_P = vel_t - vel_c;
+            // Derivative error based on the change in proportional error.
+            double vel_error_D = (vel_error_P - vel_error_P_old);
+            // Calculate the target acceleration using PID coefficients.
+            double acc_tar = ((double)Throttle_P / 1000) * vel_error_P +
+                ((double)Throttle_I / 1000000) * vel_error_I_sum +
+                ((double)Throttle_D / 1000) * vel_error_D;
+            // Update the old proportional error for the next cycle.
+            vel_error_P_old = vel_error_P;
+            // Update the integral sum with the current proportional error.
+            vel_error_I_sum += vel_error_P;
+
+            if (dist_curr < 5)  // below 5m, brake hard
+            {
+                acc_tar = -1;
+                cout << "hard brake" << endl;
+            }
+
+            // Reset the integral component and possibly throttle when close to the target at low speed.
+            if ((dist_curr < DIST_TAR_MIN || abs(dist_curr - DIST_TAR_MIN) < 3) && vel_tar < 5)
+            {
+                vel_error_I_sum *= 0.;
+                cout << "vel I  reduction" << endl;
+
+                if (vel_c < 1)  // avoid slow rolling
+                {
+                    acc_tar = 0;
+                }
+            }
+
+            if (vel_c < 2 && acc_tar < 0)  // avoid driving backwards
+            {
+                acc_tar = 0;
+                cout << "avoid backwards driving" << endl;
+            }
+
+            throttle_norm = acc_tar;
+            // red light stop
+
+            if (vel_c > 45 && abs(steering_input) > 0.1)  // slow down at sharp curves
+            {
+                throttle_norm = 0;
+                cout << "slow down at sharp curves" << endl;
+            }
+
+            if (vel_c > 63)  // // Specific condition for reducing speed.
+            {
+                throttle_norm = 0.338764;
+            }
+
+            if (throttle_norm > 1)  // normalize the throttle input to between -1 and 1
+            {
+                throttle_norm = 1;
+            }
+            else if (throttle_norm < -1)
+            {
+                throttle_norm = -1;
+            }
+
+            cout << "velocity: " << vel_c << " kmh, target: " << vel_t
+                << " kmh || P = " << ((double)Throttle_P / 1000)
+                << " == " << vel_error_P * ((double)Throttle_P / 1000)
+                << ", I = " << ((double)Throttle_I / 1000000)
+                << " == " << vel_error_I_sum * ((double)Throttle_I / 1000000)
+                << ", D = " << ((double)Throttle_D / 1000)
+                << " == " << vel_error_D * ((double)Throttle_D / 1000)
+                << " || cmd = " << throttle_norm << endl;
+        }
+    }
+
+    void getThrottleInput(tronis::CircularMultiQueuedSocket& socket)
+    {
+        string prefix_throttle = "Throttle value ";
+        socket.send(tronis::SocketData(prefix_throttle + to_string(throttle_norm)));
+    }
+    // Helper functions, no changes needed
+public:
+    // Function to process received tronis data
+    bool getData(tronis::ModelDataWrapper data_model)
+    {
+        if (data_model->GetModelType() == tronis::ModelType::Tronis)
+        {
+            std::cout << "Id: " << data_model->GetTypeId() << ", Name: " << data_model->GetName()
+                << ", Time: " << data_model->GetTime() << std::endl;
+
+            // if data is sensor output, process data
+            switch (static_cast<tronis::TronisDataType>(data_model->GetDataTypeId()))
+            {
+            case tronis::TronisDataType::Image:
+            {
+                processImage(data_model->GetName(),
+                    data_model.get_typed<tronis::ImageSub>()->Image);
+                break;
+            }
+            case tronis::TronisDataType::ImageFrame:
+            {
+                const tronis::ImageFrame& frames(
+                    data_model.get_typed<tronis::ImageFrameSub>()->Images);
+                for (size_t i = 0; i != frames.numImages(); ++i)
+                {
+                    std::ostringstream os;
+                    os << data_model->GetName() << "_" << i + 1;
+
+                    processImage(os.str(), frames.image(i));
+                }
+                break;
+            }
+            case tronis::TronisDataType::ImageFramePose:
+            {
+                const tronis::ImageFrame& frames(
+                    data_model.get_typed<tronis::ImageFramePoseSub>()->Images);
+                for (size_t i = 0; i != frames.numImages(); ++i)
+                {
+                    std::ostringstream os;
+                    os << data_model->GetName() << "_" << i + 1;
+
+                    processImage(os.str(), frames.image(i));
+                }
+                break;
+            }
+            case tronis::TronisDataType::PoseVelocity:
+            {
+                processPoseVelocity(data_model.get_typed<tronis::PoseVelocitySub>());
+                throttleControl();
+                break;
+            }
+            case tronis::TronisDataType::BoxData:
+            {
+                processBox(data_model.get_typed<tronis::BoxDataSub>());
+                // std::cout << data_model.get_typed<tronis::BoxDataSub>()->ToString() <<
+                // std::endl;
+                break;
+            }
+            default:
+            {
+                std::cout << data_model->ToString() << std::endl;
+                break;
+            }
+            }
+            return true;
+        }
+        else
+        {
+            std::cout << data_model->ToString() << std::endl;
+            return false;
+        }
+    }
+
+protected:
+    // Function to show an openCV image in a separate window
+    void showImage(std::string image_name, cv::Mat image)
+    {
+        cv::Mat out = image;
+        if (image.type() == CV_32F || image.type() == CV_64F)
+        {
+            cv::normalize(image, out, 0.0, 1.0, cv::NORM_MINMAX, image.type());
+        }
+        cv::namedWindow(image_name.c_str(), cv::WINDOW_NORMAL);
+        cv::imshow(image_name.c_str(), out);
+    }
+
+    // Function to convert tronis image to openCV image
+    bool processImage(const std::string& base_name, const tronis::Image& image)
+    {
+        std::cout << "processImage" << std::endl;
+        if (image.empty())
+        {
+            std::cout << "empty image" << std::endl;
+            return false;
+        }
+
+        image_name_ = base_name;
+        image_ = tronis::image2Mat(image);
+
+        detectLanes();
+        showImage(image_name_, image_);
+
+        return true;
+    }
+};
+
+// main loop opens socket and listens for incoming data
+int main(int argc, char** argv)
+{
+    std::cout << "Welcome to lane assistant" << std::endl;
+
+    // specify socket parameters
+    std::string socket_type = "TcpSocket";
+    std::string socket_ip = "127.0.0.1";
+    std::string socket_port = "7778";
+
+    std::ostringstream socket_params;
+    socket_params << "{Socket:\"" << socket_type << "\", IpBind:\"" << socket_ip
+        << "\", PortBind:" << socket_port << "}";
+
+    int key_press = 0;  // close app on key press 'q'
+    tronis::CircularMultiQueuedSocket msg_grabber;
+    uint32_t timeout_ms = 500;  // close grabber, if last received msg is older than this param
+
+    LaneAssistant lane_assistant;
+
+    while (key_press != 'q')
+    {
+        std::cout << "Wait for connection..." << std::endl;
+        msg_grabber.open_str(socket_params.str());
+
+        if (!msg_grabber.isOpen())
+        {
+            printf("Failed to open grabber, retry...!\n");
+            continue;
+        }
+
+        std::cout << "Start grabbing" << std::endl;
+        tronis::SocketData received_data;
+        uint32_t time_ms = 0;
+
+        while (key_press != 'q')
+        {
+            // wait for data, close after timeout_ms without new data
+            if (msg_grabber.tryPop(received_data, true))
+            {
+                // data received! reset timer
+                time_ms = 0;
+
+                // convert socket data to tronis model data
+                tronis::SocketDataStream data_stream(received_data);
+                tronis::ModelDataWrapper data_model(
+                    tronis::Models::Create(data_stream, tronis::MessageFormat::raw));
+                if (!data_model.is_valid())
+                {
+                    std::cout << "received invalid data, continue..." << std::endl;
+                    continue;
+                }
+                // identify data type
+                lane_assistant.getData(data_model);
+                lane_assistant.processData(msg_grabber);
+            }
+            else
+            {
+                // no data received, update timer
+                ++time_ms;
+                if (time_ms > timeout_ms)
+                {
+                    std::cout << "Timeout, no data" << std::endl;
+                    msg_grabber.close();
+                    break;
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    key_press = cv::waitKey(1);
+                }
+            }
+        }
+        msg_grabber.close();
+    }
+    return 0;
+}
