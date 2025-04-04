@@ -1,0 +1,89 @@
+<root BTCPP_format="4">
+<TreeNodesModel>
+  <Action ID="SetPhidgetsDigitalOutputIO">
+    <input_port name="server_name" default="setio_server">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="port_index" >index of the output to be set</input_port>
+    <input_port name="on" >true: if switch on; false: if switch off</input_port>
+    <output_port name="success">The result</output_port>
+  </Action>
+  <Action ID="OmronCylinderIOControl">
+    <input_port name="server_name" default="binary_cylinder_move_controller">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="20000ms">timeout for connecting skill action server</input_port>
+    <input_port name="agent_name" >the name of agent execute this skill</input_port>
+    <input_port name="command" >command will be executed</input_port>
+    <output_port name="success">true, if skill executed successfully</output_port>
+  </Action>
+  <Action ID="ExecutePitasc">
+    <input_port name="server_name" default="run">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="app" >Target appilcation for executing defined in Pitasc</input_port>
+    <input_port name="parameters" default="">Give parameter as 'parameter name':'value', separate by ';'</input_port>
+    <output_port name="message">response message</output_port>
+    <output_port name="pitasc_error_code_id">Error code</output_port>
+  </Action>
+  <Action ID="CobottaIOControl">
+    <input_port name="server_name" default="control_gripper_serevr">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="io_service_server_name" default="/set_cobotta_io">IO server service name (service to control io)</input_port>
+    <input_port name="open" >If open gripper, set true</input_port>
+    <input_port name="open_high_pin" >The pin set to high when open gripper</input_port>
+    <input_port name="close_high_pin" >The pin set to high when close gripper</input_port>
+    <output_port name="error_code_id">Server error code ID</output_port>
+  </Action>
+  <Action ID="WaitSignalUntilTrueNoTimeout">
+    <input_port name="server_name" default="wait_signal_until_true">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="sub_topic_name" >The topic that publish sensor data</input_port>
+    <input_port name="sub_rate" default="10">The subscription rate</input_port>
+    <output_port name="signal">true, if object present; false, if object not present</output_port>
+  </Action>
+  <Action ID="CheckSignalTimeout">
+    <input_port name="server_name" default="wait_signal_true_timeout">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="sub_topic_name" >The topic that publish sensor data</input_port>
+    <input_port name="sub_rate" default="10">The subscription rate</input_port>
+    <output_port name="signal">true, if object present; false, if object not present</output_port>
+    <output_port name="error_code_id"></output_port>
+  </Action>
+  <Action ID="ExecuteTrajectory">
+    <input_port name="server_name" default="execute_trajectory">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="20000ms">timeout for connecting skill action server</input_port>
+    <input_port name="target_group" >The target group</input_port>
+    <input_port name="trajectory" >Trajectory that will be executed by the target group</input_port>
+    <output_port name="error_code_id"></output_port>
+  </Action>
+  <Action ID="ComputePathToState">
+    <input_port name="server_name" default="compute_path_to_state">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="target_group" >The target group</input_port>
+    <input_port name="named_state" >state name</input_port>
+    <input_port name="planning_pipeline" default="pilz_industrial_motion_planner">Planner</input_port>
+    <input_port name="planner_id" default="PTP">Planner</input_port>
+    <input_port name="path_constraints" default="{path_constraints}">path_constraints</input_port>
+    <output_port name="error_code_id">true, if object present; false, if object not present</output_port>
+    <output_port name="trajectory">trajectory</output_port>
+  </Action>
+  <Action ID="OmronGPIOControl">
+    <input_port name="server_name" default="na_gpio_action_controller">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="agent_name" >the name of agent execute this skill</input_port>
+    <input_port name="command" >command will be executed</input_port>
+    <output_port name="success">true, if skill executed successfully</output_port>
+  </Action>
+  <Action ID="LoadPitasc">
+    <input_port name="server_name" default="load">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="1000ms">timeout for connecting skill action server</input_port>
+    <input_port name="file_name" >File for loading</input_port>
+    <input_port name="package" >package name</input_port>
+    <output_port name="message">response message</output_port>
+  </Action>
+  <Action ID="ControlJointsPositionsViaCtrlX">
+    <input_port name="server_name" default="vtem_point_controller">the name of skill action server</input_port>
+    <input_port name="server_timeout" default="2000ms">timeout for connecting skill action server</input_port>
+    <input_port name="joint_names" ></input_port>
+    <input_port name="joint_traj" ></input_port>
+    <output_port name="error_code"></output_port>
+  </Action>
+</TreeNodesModel>
+</root>
